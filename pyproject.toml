@@ -1,0 +1,22 @@
+[tool.poetry]
+name = "dfdiff"
+version = "0.1.0"
+description = ""
+authors = ["Ondrej Zacha <ondrej.zacha@okra.ai>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.8,<3.11"
+pandas = ">=1.0"
+numpy = ">1.20"
+kedro = ">=0.18"
+dvc = ">=2.0"
+
+[tool.poetry.group.dev.dependencies]
+jupyterlab = "^3.6.1"
+ruff = "^0.0.253"
+black = "^23.1.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
