@@ -15,6 +15,8 @@ from kedro.extras.datasets.pandas.parquet_dataset import ParquetDataSet
 
 logger = logging.getLogger(__name__)
 
+DFDIFF_VERSION = "0.1.0"
+
 
 def resolve_filepath(dataset: str, catalog, force_env: str = None) -> str:
     kedro_dataset = getattr(catalog.datasets, dataset, None)
@@ -98,66 +100,10 @@ def find_uniquely_identifying_columns(
     return list(found_combinations)
 
 
-def is_listlike_series(series: pd.Series) -> bool:
-    """Check if series likely contains list-like elements."""
-    if series.isna().all():
-        return False
-    first_notna = series.dropna().iloc[0]
-    return isinstance(first_notna, (list, np.ndarray))
-
-
-def is_dict_series(series: pd.Series) -> bool:
-    """Check if series likely contains list-like elements."""
-    if series.isna().all():
-        return False
-    first_notna = series.dropna().iloc[0]
-    return isinstance(first_notna, dict)
-
-
-def convert_listlike_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Convert list-like columns to tuple columns.
-    This is required to allow for actions like groupby, uniques etc.
-    Args:
-        df: Dataframe to adjust
-    Returns:
-        Dataframe with list-like columns converted to tuple columns.
-    """
-    df = df.copy()
-    for column in df:
-        if is_listlike_series(df[column]):
-            df[column] = df[column].apply(
-                lambda value: tuple(value)
-                if isinstance(value, (list, np.ndarray))
-                else value
-            )
-            str_if_unhashable(df, column)
-
-        elif is_dict_series(df[column]):
-            df[column] = df[column].apply(
-                lambda value: value.items() if isinstance(value, dict) else value
-            )
-            str_if_unhashable(df, column)
-
-    return df
-
-
-def mask_if_unhashable(df, column):
-    try:
-        df[column].drop_duplicates()
-    except TypeError:
-        logging.info(f"Masking column `{column}`.")
-        df[column] = "MASKED"
-
-
-def str_if_unhashable(df: pd.DataFrame, column: str) -> None:
-    try:
-        df[column].drop_duplicates()
-    except TypeError:
-        logging.info(f"Converting column `{column}` to string dtype.")
-        df[column] = df[column].astype(str)
-
-
 def ensure_hashable(series: pd.Series) -> pd.Series:
+    if any(series.apply(pd.api.types.is_list_like)):
+        return series.astype(pd.StringDtype())
+
     try:
         _ = series.drop_duplicates()
         return series
@@ -166,23 +112,13 @@ def ensure_hashable(series: pd.Series) -> pd.Series:
         return series.astype(pd.StringDtype())
 
 
-def _collapsible_df(df: pd.DataFrame, name: str, max_rows: int = 60) -> str:
-    return f"""<details><summary><h4>{name} ({len(df)} records)</h4></summary>
-<i>Showing up to {max_rows} rows.</i>
-{df.head(max_rows).to_html()}
-</details>
-"""
-
-
 class DfDiff:
     def __init__(
         self,
         df1,
         df2,
         *,
-        index_cols=None,
-        # value_cols=None,
-        # meta_cols=None,
+        index_cols,
     ):
         # assert not df1.equals(df2)
         assert df1.columns.equals(df2.columns)
@@ -216,23 +152,50 @@ class DfDiff:
             "df2_overlap": self._df2.loc[self.indices["both"]],
         }
 
-        # TODO: rename columns - (self, other) -> (current, reference)
-        self.common_diff = self._calculate_value_diff(
+        self.common_diff, value_match_indices = self._calculate_value_diff(
             self.subsets["df1_overlap"], self.subsets["df2_overlap"]
+        )
+        value_diff_indices = self.indices["both"].difference(value_match_indices)
+
+        self.indices["both_match"] = value_match_indices
+        self.indices["both_diff"] = value_diff_indices
+
+        # Wrong?
+        self.subsets["both_match"] = self._df1.loc[self.indices["both_match"]]
+        self.subsets["both_diff"] = self._df1.loc[self.indices["both_diff"]]
+
+        assert (
+            len(self._df1)
+            == len(self.df1)
+            == len(self.subsets["df1_only"])
+            + len(self.subsets["both_match"])
+            + len(self.subsets["both_diff"])
+        )
+        assert (
+            len(self._df2)
+            == len(self.df2)
+            == len(self.subsets["df2_only"])
+            + len(self.subsets["both_match"])
+            + len(self.subsets["both_diff"])
+        )
+        assert sum(len(d) for d in self.common_diff.values()) == len(
+            self.subsets["both_diff"]
         )
 
     def _find_diffs(self, series1: pd.Series, series2: pd.Series):
         assert series1.index.equals(series2.index)
         assert series1.dtype == series2.dtype
+
+        both_na = series1.isna() & series2.isna()
+
         if pd.api.types.is_float_dtype(series1.dtype):
-            return np.isclose(series1, series2, atol=1e-7) | (
-                series1.isna() & series2.isna()
-            )
-        return series1 == series2
+            return np.isclose(series1, series2, atol=1e-7) | both_na
+
+        return (series1 == series2) | both_na
 
     def _calculate_value_diff(
         self, df1: pd.DataFrame, df2: pd.DataFrame
-    ) -> pd.DataFrame:
+    ) -> Dict[str, pd.DataFrame]:
         df1 = df1.sort_index()
         df2 = df2.sort_index()[df1.columns]
 
@@ -240,24 +203,22 @@ class DfDiff:
         for (name, series1), (name, series2) in zip(df1.items(), df2.items()):
             diff_masks[name] = ~self._find_diffs(series1, series2)
 
-        diff_df = (
-            pd.DataFrame(diff_masks).assign(
-                # cols=lambda d: d.apply(tuple, axis=1),
-                cols=lambda d: d.apply(
-                    lambda row: tuple(d.columns[row]), axis=1
-                ),  # TODO: slow
-                # n_cols=lambda d: d["cols"].str.len(),
-                # n_records=lambda d: d.groupby("cols")["cols"].transform("size"),
-            )
-            # .loc[lambda d: d["n_cols"] > 0]
+        diff_df = pd.DataFrame(diff_masks).assign(
+            cols=lambda d: d.apply(
+                lambda row: tuple(d.columns[row]), axis=1
+            ),  # TODO: slow
         )
 
-        subset_comparisons = {}
+        additional_full_match_idxs = pd.Index([])
+
+        subset_comparisons: Dict[str, pd.DataFrame] = {}
         for cols, diff_subset in diff_df.groupby("cols"):
-            if (n_cols := len(cols)) == 0:
+            subset_index = diff_subset.index
+
+            if not cols:
+                additional_full_match_idxs = subset_index
                 continue
 
-            subset_index = diff_subset.index
             subset_comparison = df1.loc[subset_index, list(cols)].compare(
                 df2.loc[subset_index, list(cols)]
             )
@@ -273,40 +234,14 @@ class DfDiff:
             subset_comparison = subset_comparison.join(extra_metadata)
             subset_comparisons[cols] = subset_comparison
 
-            print(cols)
-            display(subset_comparison)
-
-        # display(subset_comparisons)
-        # display(pd.concat(subset_comparisons.values()))
-        # name_groups = _group_series(diff_masks)
-
-        # for name_group in name_groups:
-        #     diff_mask = diff_masks[name_group[0]]
-        #     if not diff_mask.any():
-        #         continue
-        #     xx = df1.loc[diff_mask, name_group].compare(
-        #         df2.loc[diff_mask, name_group],
-        #     )
-        #     xx.columns = xx.columns.set_levels(["current", "reference"], level=1)
-        #     print(name_group)
-        #     display(xx)
-
-        df_comp = df1.compare(df2)
-        df_comp.columns = df_comp.columns.set_levels(["current", "reference"], level=1)
-        return df_comp
+        return subset_comparisons, additional_full_match_idxs
 
     def _categorise_indices(
         self, df1: pd.DataFrame, df2: pd.DataFrame
     ) -> Dict[str, pd.Index]:
-        # TODO: why different? for tuples?
-        # df_merged = pd.merge(df1, df2, on=self.index_cols, how="outer", indicator=True)
-
         df_merged = pd.merge(
             df1, df2, left_index=True, right_index=True, how="outer", indicator=True
         )
-        # print(
-        #     f"{len(df1)=}, {len(df2)=}, \n{df_merged._merge.value_counts(dropna=False)}"
-        # )
 
         left_only_idx = df_merged.loc[lambda d: d["_merge"] == "left_only"].index
         right_only_idx = df_merged.loc[lambda d: d["_merge"] == "right_only"].index
@@ -325,26 +260,15 @@ class DfDiff:
         }
 
     def is_calculated(self) -> bool:
-        # TODO
-        return all(
-            (
-                # self.indicator_overlap is not None,
-                # self.df1_only is not None,
-                # self.df2_only is not None,
-                self.common_diff
-                is not None,
-            )
-        )
+        return self.common_diff is not None
 
     def display(self) -> None:
         if not self.is_calculated():
             raise ValueError("Diff not calculated yet.")
 
         display(
-            HTML(_collapsible_df(self.subsets["df1_overlap"], "🟰 Matching")),
-            # TODO: improve display of Changed - isclose; per column / cluster;
-            # self/other
-            HTML(_collapsible_df(self.common_diff, "🔀 Changed")),
+            HTML(_collapsible_df(self.subsets["both_match"], "🟰 Matching")),
+            HTML(_display_common_diff(self.common_diff)),
             HTML(_collapsible_df(self.subsets["df1_only"], "➕ Added")),
             HTML(_collapsible_df(self.subsets["df2_only"], "➖ Dropped")),
         )
@@ -352,6 +276,32 @@ class DfDiff:
     def __call__(self):
         self.calculate()
         self.display()
+
+
+def _collapsible_df(df: pd.DataFrame, name: str, max_rows: int = 60) -> str:
+    return f"""<details><summary><h4>{name} ({len(df)} records)</h4></summary>
+<i>Showing up to {max_rows} rows.</i>
+{df.head(max_rows).to_html()}
+</details>
+"""
+
+
+def _display_common_diff(common_diff: dict, max_rows: int = 10) -> str:
+    total_diff_rows = sum(len(df) for df in common_diff.values())
+    list_items = []
+
+    for cols, df in sorted(common_diff.items(), key=lambda x: -len(x[1])):
+        li = f"<li>{cols}<br>{df.head(max_rows).to_html()} ({len(df)} rows)</li>"
+        list_items.append(li)
+
+    return f"""<details>
+<summary><h4>🔀 Changed ({total_diff_rows} records)</h4></summary>
+<i>Showing up to {max_rows} rows.</i>
+<ul>
+{'/n'.join(list_items)}
+</ul>
+</details>
+"""
 
 
 def _hash_series(series):
@@ -372,9 +322,9 @@ def validate(
     dataset: str,
     rev_reference: str,
     rev_current: str = "HEAD",
+    force_env: Optional[str] = None,
 ) -> Optional[DfDiff]:
-
-    filepath = resolve_filepath(dataset, catalog)
+    filepath = resolve_filepath(dataset, catalog, force_env=force_env)
     logger.info(f"Resolved filepath: {filepath}")
 
     hash_current = get_git_revision_hash(rev_current)
@@ -383,14 +333,14 @@ def validate(
     path_reference = _get_dvc_url(filepath, rev=hash_reference)
 
     if path_current == path_reference:
-        logger.info("Identical files")
+        print("Identical files")
         return None
 
     df_current = load_from_rev(filepath, rev=hash_current)
     df_reference = load_from_rev(filepath, rev=hash_reference)
 
-    df_current = df_current.pipe(convert_listlike_columns)
-    df_reference = df_reference.pipe(convert_listlike_columns)
+    df_current = df_current.apply(ensure_hashable)
+    df_reference = df_reference.apply(ensure_hashable)
 
     if df_current.duplicated().any():
         raise ValueError("Current dataframe is duplicated")
@@ -410,7 +360,8 @@ def validate(
 
         display(HTML(f"<h3>{dataset}</h3>"))
         dfd.display()
-    except Exception as e:
-        logger.warning(e)
+    except Exception:
+        raise
+        # logger.warning(e)
 
     return dfd
