@@ -4,8 +4,7 @@ import logging
 import os
 import pathlib
 import subprocess
-from collections import defaultdict
-from typing import Dict, List, Mapping, Optional, Tuple
+from typing import Collection, Dict, List, Optional, Sequence, Tuple
 
 import dvc.api
 import numpy as np
@@ -100,16 +99,17 @@ def find_uniquely_identifying_columns(
     return list(found_combinations)
 
 
-def ensure_hashable(series: pd.Series) -> pd.Series:
-    if any(series.apply(pd.api.types.is_list_like)):
-        return series.astype(pd.StringDtype())
-
-    try:
-        _ = series.drop_duplicates()
-        return series
-    except TypeError:
-        logging.warning(f"Converting series `{series.name}` to string dtype.")
-        return series.astype(pd.StringDtype())
+def ensure_hashable(df):
+    df = df.copy()
+    unhashable_cols = list(
+        df.columns[~df.applymap(pd.api.types.is_hashable).all(axis=0)]
+    )
+    if unhashable_cols:
+        logging.warning(
+            f"Converting unhashable cols {unhashable_cols} to string dtype."
+        )
+        df[unhashable_cols] = df[unhashable_cols].astype(pd.StringDtype())
+    return df, unhashable_cols
 
 
 class DfDiff:
@@ -132,16 +132,21 @@ class DfDiff:
         self.indices = None
         self.subsets = None
         self.common_diff = None
+        self.unhashable_cols = None
 
-    def _prepare(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _prepare(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
         # TODO: reset index -> name
-        df = df.apply(ensure_hashable)
+        # TODO: check unhashable cols first?
+        df, unhashable_cols = ensure_hashable(df)
         df = df.set_index(self.index_cols)
-        return df
+        return df, list(unhashable_cols)
 
     def calculate(self):
-        self._df1 = self._prepare(self.df1)
-        self._df2 = self._prepare(self.df2)
+        self._df1, _unhashable_cols1 = self._prepare(self.df1)
+        self._df2, _unhashable_cols2 = self._prepare(self.df2)
+
+        assert _unhashable_cols1 == _unhashable_cols2
+        self.unhashable_cols = _unhashable_cols1
 
         self.indices = self._categorise_indices(self._df1, self._df2)
 
@@ -291,7 +296,13 @@ def _display_common_diff(common_diff: dict, max_rows: int = 10) -> str:
     list_items = []
 
     for cols, df in sorted(common_diff.items(), key=lambda x: -len(x[1])):
-        li = f"<li>{cols}<br>{df.head(max_rows).to_html()} ({len(df)} rows)</li>"
+        cols_formatted = ", ".join(
+            f"<b>Differing columns:</b> <code>{col}</code>" for col in cols
+        )
+        li = f"""
+        <li>{cols_formatted} ({len(df)} rows, showing top {min(max_rows, len(df))})<br>
+        {df.head(max_rows).to_html()}<br><br></li>
+        """
         list_items.append(li)
 
     return f"""<details>
@@ -304,17 +315,22 @@ def _display_common_diff(common_diff: dict, max_rows: int = 10) -> str:
 """
 
 
-def _hash_series(series):
-    return series.to_numpy().tobytes()
+def choose_best_id_cols(
+    col_opts: Collection[Tuple[str, ...]], orig_cols: Sequence[str]
+) -> List[str]:
+    """Get columns with most ids in them, or matching original column order"""
+    orig_orders = {col: order for order, col in enumerate(orig_cols, start=1)}
 
+    # Number of columns containing ID
+    def n_ids(cols):
+        return sum(col.endswith("id") for col in cols)
 
-def _group_series(series_map: Mapping[str, pd.Series]) -> List[List[str]]:
-    col_groups = defaultdict(list)
-    for name, col in series_map.items():
-        hsh = _hash_series(col)
-        col_groups[hsh].append(name)
+    # Sum of column orders
+    def orig_order(cols):
+        return sum(orig_orders[col] for col in cols)
 
-    return list(col_groups.values())
+    sorted_opts = sorted(col_opts, key=lambda cols: (-n_ids(cols), orig_order(cols)))
+    return list(sorted_opts[0])
 
 
 def validate(
@@ -339,22 +355,18 @@ def validate(
     df_current = load_from_rev(filepath, rev=hash_current)
     df_reference = load_from_rev(filepath, rev=hash_reference)
 
-    df_current = df_current.apply(ensure_hashable)
-    df_reference = df_reference.apply(ensure_hashable)
+    df_current, _ = ensure_hashable(df_current)
+    df_reference, _ = ensure_hashable(df_reference)
 
     if df_current.duplicated().any():
         raise ValueError("Current dataframe is duplicated")
     if df_reference.duplicated().any():
         raise ValueError("Reference dataframe is duplicated")
 
-    index_cols_opts = find_uniquely_identifying_columns(
-        df_current.select_dtypes(exclude=float)
-    )
-    assert isinstance(index_cols_opts, list), "Indices not supported as identifiers yet"
+    index_cols = infer_index_cols(df_current)
 
-    index_cols = list(index_cols_opts[0])
     logger.info(f"Resolved index_cols: {index_cols}")
-    dfd = DfDiff(df_current, df_reference, index_cols=index_cols.copy())
+    dfd = DfDiff(df_current, df_reference, index_cols=index_cols)
     try:
         dfd.calculate()
 
@@ -365,3 +377,15 @@ def validate(
         # logger.warning(e)
 
     return dfd
+
+
+def infer_index_cols(df: pd.DataFrame) -> List[str]:
+    index_cols_opts = find_uniquely_identifying_columns(df.select_dtypes(exclude=float))
+    if index_cols_opts is None:
+        raise RuntimeError("Fully duplicated dataframe")
+
+    if not isinstance(index_cols_opts, list):
+        raise RuntimeError("Indices not supported as identifiers yet")
+
+    index_cols = choose_best_id_cols(index_cols_opts, list(df))
+    return index_cols
