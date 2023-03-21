@@ -12,7 +12,6 @@ import pandas as pd
 from IPython.display import HTML, display
 from kedro.extras.datasets.pandas.parquet_dataset import ParquetDataSet
 
-logger = logging.getLogger(__name__)
 
 DFDIFF_VERSION = "0.1.0"
 
@@ -267,24 +266,31 @@ class DfDiff:
     def is_calculated(self) -> bool:
         return self.common_diff is not None
 
-    def display(self) -> None:
+    def html(self) -> str:
         if not self.is_calculated():
             raise ValueError("Diff not calculated yet.")
 
-        display(
-            HTML(_collapsible_df(self.subsets["both_match"], "🟰 Matching")),
-            HTML(_display_common_diff(self.common_diff)),
-            HTML(_collapsible_df(self.subsets["df1_only"], "➕ Added")),
-            HTML(_collapsible_df(self.subsets["df2_only"], "➖ Dropped")),
+        return "".join(
+            [
+                _collapsible_df(self.subsets["both_match"], "🟰 Matching"),
+                _display_common_diff(self.common_diff),
+                _collapsible_df(self.subsets["df1_only"], "➕ Added"),
+                _collapsible_df(self.subsets["df2_only"], "➖ Dropped"),
+            ]
         )
+
+    def display(self) -> None:
+        display(HTML(self.html()))
 
     def __call__(self):
         self.calculate()
         self.display()
 
 
-def _collapsible_df(df: pd.DataFrame, name: str, max_rows: int = 60) -> str:
-    return f"""<details><summary><h4>{name} ({len(df)} records)</h4></summary>
+def _collapsible_df(
+    df: pd.DataFrame, name: str, max_rows: int = 60, highlight_tag: str = "h4"
+) -> str:
+    return f"""<details><summary><{highlight_tag}>{name} ({len(df)} records)</{highlight_tag}></summary>
 <i>Showing up to {max_rows} rows.</i>
 {df.head(max_rows).to_html()}
 </details>
@@ -296,12 +302,10 @@ def _display_common_diff(common_diff: dict, max_rows: int = 10) -> str:
     list_items = []
 
     for cols, df in sorted(common_diff.items(), key=lambda x: -len(x[1])):
-        cols_formatted = ", ".join(
-            f"<b>Differing columns:</b> <code>{col}</code>" for col in cols
-        )
+        cols_formatted = ", ".join(f"<code>{col}</code>" for col in cols)
+        # item_name = f"Differing columns: {cols_formatted}"
         li = f"""
-        <li>{cols_formatted} ({len(df)} rows, showing top {min(max_rows, len(df))})<br>
-        {df.head(max_rows).to_html()}<br><br></li>
+        <li>{_collapsible_df(df=df, name=cols_formatted, max_rows=max_rows, highlight_tag="span")}</li>
         """
         list_items.append(li)
 
@@ -309,7 +313,7 @@ def _display_common_diff(common_diff: dict, max_rows: int = 10) -> str:
 <summary><h4>🔀 Changed ({total_diff_rows} records)</h4></summary>
 <i>Showing up to {max_rows} rows.</i>
 <ul>
-{'/n'.join(list_items)}
+{''.join(list_items)}
 </ul>
 </details>
 """
@@ -339,9 +343,12 @@ def validate(
     rev_reference: str,
     rev_current: str = "HEAD",
     force_env: Optional[str] = None,
+    display_output: bool = False,
 ) -> Optional[DfDiff]:
+    display(HTML(f"<h3>{dataset}</h3>"))
+
     filepath = resolve_filepath(dataset, catalog, force_env=force_env)
-    logger.info(f"Resolved filepath: {filepath}")
+    logging.info(f"Resolved filepath: {filepath}")
 
     hash_current = get_git_revision_hash(rev_current)
     hash_reference = get_git_revision_hash(rev_reference)
@@ -355,6 +362,8 @@ def validate(
     df_current = load_from_rev(filepath, rev=hash_current)
     df_reference = load_from_rev(filepath, rev=hash_reference)
 
+    logging.info(f"Dataframe sizes: {df_current.shape=}, {df_reference.shape=}")
+
     df_current, _ = ensure_hashable(df_current)
     df_reference, _ = ensure_hashable(df_reference)
 
@@ -365,16 +374,15 @@ def validate(
 
     index_cols = infer_index_cols(df_current)
 
-    logger.info(f"Resolved index_cols: {index_cols}")
+    logging.info(f"Resolved index_cols: {index_cols}")
     dfd = DfDiff(df_current, df_reference, index_cols=index_cols)
     try:
         dfd.calculate()
-
-        display(HTML(f"<h3>{dataset}</h3>"))
-        dfd.display()
+        if display_output:
+            dfd.display()
     except Exception:
         raise
-        # logger.warning(e)
+        # logging.warning(e)
 
     return dfd
 
