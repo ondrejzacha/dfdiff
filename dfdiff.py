@@ -131,6 +131,7 @@ class DfDiff:
         self.indices = None
         self.subsets = None
         self.common_diff = None
+        self.changes_per_col = None
         self.unhashable_cols = None
 
     def _prepare(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
@@ -156,7 +157,11 @@ class DfDiff:
             "df2_overlap": self._df2.loc[self.indices["both"]],
         }
 
-        self.common_diff, value_match_indices = self._calculate_value_diff(
+        (
+            self.common_diff,
+            value_match_indices,
+            self.changes_per_col,
+        ) = self._calculate_value_diff(
             self.subsets["df1_overlap"], self.subsets["df2_overlap"]
         )
         value_diff_indices = self.indices["both"].difference(value_match_indices)
@@ -212,6 +217,9 @@ class DfDiff:
                 lambda row: tuple(d.columns[row]), axis=1
             ),  # TODO: slow
         )
+        changes_per_col = (
+            diff_df.select_dtypes(bool).sum().sort_values(ascending=False).to_dict()
+        )
 
         additional_full_match_idxs = pd.Index([])
 
@@ -238,7 +246,7 @@ class DfDiff:
             subset_comparison = subset_comparison.join(extra_metadata)
             subset_comparisons[cols] = subset_comparison
 
-        return subset_comparisons, additional_full_match_idxs
+        return subset_comparisons, additional_full_match_idxs, changes_per_col
 
     def _categorise_indices(
         self, df1: pd.DataFrame, df2: pd.DataFrame
@@ -273,7 +281,7 @@ class DfDiff:
         return "".join(
             [
                 _collapsible_df(self.subsets["both_match"], "🟰 Matching"),
-                _display_common_diff(self.common_diff),
+                _display_common_diff(self.common_diff, self.changes_per_col),
                 _collapsible_df(self.subsets["df1_only"], "➕ Added"),
                 _collapsible_df(self.subsets["df2_only"], "➖ Dropped"),
             ]
@@ -290,28 +298,50 @@ class DfDiff:
 def _collapsible_df(
     df: pd.DataFrame, name: str, max_rows: int = 60, highlight_tag: str = "h4"
 ) -> str:
-    return f"""<details><summary><{highlight_tag}>{name} ({len(df)} records)</{highlight_tag}></summary>
+    return f"""<details><summary><{highlight_tag}>
+{name} ({len(df)} records)
+</{highlight_tag}></summary>
 <i>Showing up to {max_rows} rows.</i>
 {df.head(max_rows).to_html()}
 </details>
 """
 
 
-def _display_common_diff(common_diff: dict, max_rows: int = 10) -> str:
+def _display_common_diff(
+    common_diff: dict, changes_per_col: dict, max_rows: int = 10
+) -> str:
+    # TODO: summary per col
     total_diff_rows = sum(len(df) for df in common_diff.values())
+
+    col_list_items = [
+        f"<li><code>{col}</code>: {n} ({n/total_diff_rows:.1%})</li>"
+        for col, n in changes_per_col.items()
+        if n > 0
+    ]
+
     list_items = []
 
     for cols, df in sorted(common_diff.items(), key=lambda x: -len(x[1])):
         cols_formatted = ", ".join(f"<code>{col}</code>" for col in cols)
-        # item_name = f"Differing columns: {cols_formatted}"
         li = f"""
-        <li>{_collapsible_df(df=df, name=cols_formatted, max_rows=max_rows, highlight_tag="span")}</li>
+        <li>{_collapsible_df(
+            df=df, 
+            name=cols_formatted, 
+            max_rows=max_rows, 
+            highlight_tag="span"
+            )}</li>
         """
         list_items.append(li)
 
     return f"""<details>
 <summary><h4>🔀 Changed ({total_diff_rows} records)</h4></summary>
-<i>Showing up to {max_rows} rows.</i>
+<h5>Changes per column</h5>
+<ul>
+{''.join(col_list_items)}
+</ul>
+
+<h5>Changes per group of columns</h5>
+<i>Click for relevant dataframe subset</i>
 <ul>
 {''.join(list_items)}
 </ul>
